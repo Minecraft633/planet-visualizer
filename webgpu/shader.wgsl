@@ -27,7 +27,7 @@
  * - camera_exposure: Camera position (xyz) + exposure value (w)
  * - sun_direction_size: Sun direction (xyz) + tan(sun_angular_radius) (w)
  * - white_point_size: White point for tone mapping (xyz) + cos(sun_angular_radius) (w)
- * - earth_center: Earth's center position in world space (xyz)
+ * - earth_center: Earth's center position in world space (xyz) + specular strength (w)
  */
 struct Globals {
   view_from_clip : mat4x4f,
@@ -44,19 +44,12 @@ struct Globals {
 @group(0) @binding(2) var scattering_texture : texture_3d<f32>;      // Combined scattering LUT (4D packed into 3D)
 @group(0) @binding(3) var irradiance_texture : texture_2d<f32>;      // Ground irradiance LUT
 @group(0) @binding(4) var lut_sampler : sampler;                      // Linear sampler for all LUTs
-@group(1) @binding(0) var sphereTexture: texture_2d<f32>;
-@group(1) @binding(1) var sphereSampler: sampler;
-@group(1) @binding(2) var specularMap: texture_2d<f32>;
-@group(1) @binding(3) var specularSampler: sampler;
-
-fn sphereUV(point: vec3f) -> vec2f {
-    let normal = normalize(point - kSphereCenter);
-
-    let u = atan2(normal.y, normal.x) / (2.0 * PI) + 0.5;
-    let v = acos(clamp(normal.z, -1.0, 1.0)) / PI;
-
-    return vec2f(u, v);
-}
+@group(0) @binding(5) var planet_surface_texture : texture_2d<f32>; // Image mapped onto the demo sphere
+@group(0) @binding(6) var planet_surface_sampler : sampler;            // Wrap longitude, clamp latitude
+@group(0) @binding(7) var planet_specular_texture : texture_2d<f32>; // Specular intensity map
+@group(0) @binding(8) var cloud_texture : texture_2d<f32>; // RGBA cloud map (alpha is opacity)
+@group(0) @binding(9) var planet_bump_texture : texture_2d<u32>; // R16Uint height map
+@group(0) @binding(10) var cloud_bump_texture : texture_2d<u32>; // R16Uint height map
 
 // ============================================================================
 // ATMOSPHERE CONSTANTS AND TYPE DEFINITIONS
@@ -93,9 +86,6 @@ const watt : f32 = 1.0;   // Watts (power)
 const lm : f32 = 1.0;     // Lumens (luminous flux)
 const PI : f32 = 3.14159265358979323846;
 
-const specular_strength: f32 = 0.5;
-const shininess: f32 = 32.0;
-
 // Derived units for radiometric quantities
 const m2 : f32 = m * m;
 const m3 : f32 = m * m * m;
@@ -120,17 +110,14 @@ const SUN_SPECTRAL_RADIANCE_TO_LUMINANCE : vec3f =
 /**
  * Demo Scene Objects
  *
- * The demo includes a small sphere in the scene to demonstrate atmospheric effects
- * on objects. These constants define its properties:
- * - kLengthUnitInMeters: The model uses kilometers (1000m) as its base unit
- * - kSphereCenter: Center position of the demo sphere (1km above origin)
- * - kSphereRadius: Radius of the demo sphere (1km)
- * - kSphereAlbedo: Reflectance of the sphere (0.8 = bright white)
- * - kGroundAlbedo: Reflectance of the ground (dark with slight blue tint)
+ * The textured sphere now represents the planet itself, matching the
+ * atmospheric model's ground sphere. All distances are in kilometers.
+ * - kSphereCenter: same center as the planet (0, 0, -bottom_radius)
+ * - kSphereRadius: same radius as the planet (bottom_radius)
  */
 const kLengthUnitInMeters : f32 = 1000.0;
-const kSphereCenter : vec3f = vec3f(0.0, 0.0, 1000.0) / kLengthUnitInMeters;
-const kSphereRadius : f32 = 6360000 / kLengthUnitInMeters;
+const kSphereCenter : vec3f = vec3f(0.0, 0.0, -6360.0);
+const kSphereRadius : f32 = 6360.0;
 const kSphereAlbedo : vec3f = vec3f(0.8);
 const kGroundAlbedo : vec3f = vec3f(0.0, 0.0, 0.04);
 
@@ -1061,6 +1048,7 @@ struct VertexInput {
 struct VertexOutput {
   @builtin(position) position : vec4f,  // Clip space position for rasterizer
   @location(0) view_ray : vec3f,        // View ray direction in world space
+  @location(1) view_origin : vec3f,     // Per-pixel ray origin (varies in orthographic mode)
 }
 
 /**
@@ -1081,10 +1069,21 @@ fn vs_main(input : VertexInput) -> VertexOutput {
   var output : VertexOutput;
   output.position = clip;
 
-  // Transform clip space position to world space direction
+  // Perspective projection uses a common camera origin and diverging rays.
+  // Orthographic projection is identified by view_clip.w == 0: each pixel's
+  // ray starts at a different point on the view plane, but all rays are parallel.
   let view_clip = globals.view_from_clip * clip;
-  output.view_ray =
-      (globals.model_from_view * vec4f(view_clip.xyz, 0.0)).xyz;
+  if (view_clip.w == 0.0) {
+    output.view_origin =
+        (globals.model_from_view * vec4f(view_clip.xyz, 1.0)).xyz;
+    output.view_ray =
+        (globals.model_from_view * vec4f(0.0, 0.0, -1.0, 0.0)).xyz;
+  } else {
+    output.view_origin =
+        (globals.model_from_view * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
+    output.view_ray =
+        (globals.model_from_view * vec4f(view_clip.xyz, 0.0)).xyz;
+  }
 
   return output;
 }
@@ -1107,15 +1106,54 @@ fn vs_main(input : VertexInput) -> VertexOutput {
  *
  * Returns final RGBA color ready for display.
  */
+// Equirectangular map coordinates shared by color, cloud, specular and bump maps.
+fn SphereUV(normal : vec3f) -> vec2f {
+  let longitude = atan2(normal.y, normal.x);
+  let latitude = asin(clamp(normal.z, -1.0, 1.0));
+  return vec2f(longitude / (2.0 * PI) + 0.5, 0.5 - latitude / PI);
+}
+
+// Integer height textures preserve all 16 bits. Bilinear filtering is done
+// manually because WebGPU integer textures cannot use a filtering sampler.
+fn SampleHeight16(heightmap : texture_2d<u32>, uv : vec2f) -> f32 {
+  let dimensions_u = textureDimensions(heightmap, 0);
+  let dimensions = vec2i(dimensions_u);
+  let p = uv * vec2f(dimensions_u) - vec2f(0.5);
+  let base = vec2i(floor(p));
+  let f = fract(p);
+  let x0 = ((base.x % dimensions.x) + dimensions.x) % dimensions.x;
+  let x1 = (x0 + 1) % dimensions.x;
+  let y0 = clamp(base.y, 0, dimensions.y - 1);
+  let y1 = clamp(base.y + 1, 0, dimensions.y - 1);
+  let h00 = f32(textureLoad(heightmap, vec2i(x0, y0), 0).r) / 65535.0;
+  let h10 = f32(textureLoad(heightmap, vec2i(x1, y0), 0).r) / 65535.0;
+  let h01 = f32(textureLoad(heightmap, vec2i(x0, y1), 0).r) / 65535.0;
+  let h11 = f32(textureLoad(heightmap, vec2i(x1, y1), 0).r) / 65535.0;
+  return mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y);
+}
+
+// Returns direct-sun attenuation from the cloud shell at a point on/below it.
+fn CloudShadowFactor(point : vec3f, sun_direction : vec3f) -> f32 {
+  let cloud_radius = ATMOSPHERE.bottom_radius + 8.0;
+  let p = point - globals.earth_center.xyz;
+  let b = dot(p, sun_direction);
+  let c = dot(p, p) - cloud_radius * cloud_radius;
+  let disc = b * b - c;
+  if (disc <= 0.0) { return 1.0; }
+  let t = -b + sqrt(disc);
+  if (t <= 0.0) { return 1.0; }
+  let cloud_point = point + sun_direction * t;
+  let cloud_normal = normalize(cloud_point - globals.earth_center.xyz);
+  let alpha = textureSampleLevel(cloud_texture, planet_surface_sampler, SphereUV(cloud_normal), 0.0).a;
+  return mix(1.0, 0.12, smoothstep(0.28, 0.68, alpha));
+}
+
 @fragment
 fn fs_main(input : VertexOutput) -> @location(0) vec4f {
   // Extract uniforms and compute derived values
   let view_ray = input.view_ray;
   let view_dir = normalize(view_ray);
-  let camera = vec3f(
-      globals.camera_exposure.x,
-      globals.camera_exposure.y,
-      globals.camera_exposure.z);
+  let camera = input.view_origin;
   let earth_center = globals.earth_center.xyz;
   let sun_direction = normalize(globals.sun_direction_size.xyz);
   let sun_size = vec2f(globals.sun_direction_size.w, globals.white_point_size.w);
@@ -1146,9 +1184,11 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
 
   var sphere_alpha = 0.0;
   var sphere_radiance = vec3f(0.0);
+  var sphere_distance_for_composite = 1e30;
   if (discriminant >= 0.0) {
     let distance_to_intersection = -p_dot_v - sqrt(discriminant);
     if (distance_to_intersection > 0.0) {
+      sphere_distance_for_composite = distance_to_intersection;
       // Compute alpha for soft anti-aliased edges
       let ray_sphere_distance =
           kSphereRadius - sqrt(ray_sphere_center_squared_distance);
@@ -1160,47 +1200,58 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
       // Compute direct lighting (sun + sky) at intersection point
       let point = camera + view_dir * distance_to_intersection;
       let normal = normalize(point - kSphereCenter);
-
-      
-      let uv = sphereUV(point);
-
-      let texel = textureSampleLevel(
-          sphereTexture,
-          sphereSampler,
-          uv,
-          0.0
-      );
-      let sphere_albedo = texel.rgb;
-
+      // Convert the sphere normal to equirectangular UV coordinates.
+      // Longitude wraps horizontally; latitude is clamped vertically.
+      let surface_uv = SphereUV(normal);
+      // Height-gradient bump mapping. R16Unorm maps retain all 16 bits of input.
+      let bump_dims = vec2f(textureDimensions(planet_bump_texture, 0));
+      let bump_du = 1.0 / max(bump_dims.x, 1.0);
+      let bump_dv = 1.0 / max(bump_dims.y, 1.0);
+      let h_left = SampleHeight16(planet_bump_texture, surface_uv - vec2f(bump_du, 0.0));
+      let h_right = SampleHeight16(planet_bump_texture, surface_uv + vec2f(bump_du, 0.0));
+      let h_up = SampleHeight16(planet_bump_texture, surface_uv - vec2f(0.0, bump_dv));
+      let h_down = SampleHeight16(planet_bump_texture, surface_uv + vec2f(0.0, bump_dv));
+      let east = normalize(vec3f(-normal.y, normal.x, 0.0001));
+      let north = normalize(cross(normal, east));
+      let slope_u = (h_right - h_left) / (2.0 * bump_du) * (18.0 / (2.0 * PI * ATMOSPHERE.bottom_radius));
+      let slope_v = (h_down - h_up) / (2.0 * bump_dv) * (18.0 / (PI * ATMOSPHERE.bottom_radius));
+      let bumped_normal = normalize(normal - east * slope_u - north * slope_v);
+      let surface_srgb = textureSample(
+          planet_surface_texture, planet_surface_sampler, surface_uv).rgb;
+      // Convert sampled sRGB-like color values to linear reflectance before lighting.
+      let surface_albedo = pow(max(surface_srgb, vec3f(0.0)), vec3f(2.2));
+      // The specular map is grayscale (or uses its red channel as intensity):
+      // black = matte, white = strongest specular reflection.
+      let specular_sample = textureSample(
+          planet_specular_texture, planet_surface_sampler, surface_uv).rgb;
+      let specular_mask = clamp(max(specular_sample.r,
+          max(specular_sample.g, specular_sample.b)), 0.0, 1.0);
       let irradiance = GetSunAndSkyIrradiance(
+          ATMOSPHERE, point - earth_center, bumped_normal, sun_direction);
+      let cloud_shadow = CloudShadowFactor(point, sun_direction);
+      let direct_irradiance = irradiance.sun * cloud_shadow;
+      let diffuse_radiance = surface_albedo * (1.0 / PI) *
+          (direct_irradiance + irradiance.sky);
+      // Blinn-Phong sun highlight, modulated per-pixel by the specular map.
+      let half_vector = normalize(sun_direction - view_dir);
+      let n_dot_l = max(dot(bumped_normal, sun_direction), 0.0);
+      let n_dot_h = max(dot(bumped_normal, half_vector), 0.0);
+      let specular_lobe = pow(n_dot_h, 96.0) * n_dot_l;
+      let specular_strength = max(globals.earth_center.w, 0.0);
+      let specular_radiance = direct_irradiance * specular_mask * specular_lobe * specular_strength;
+      sphere_radiance = diffuse_radiance + specular_radiance;
+
+      // Add atmospheric scattering between camera and sphere
+      let shadow_length =
+          max(0.0, min(shadow_out, distance_to_intersection) - shadow_in) *
+          lightshaft_fadein_hack;
+      let scatter = GetSkyRadianceToPoint(
           ATMOSPHERE,
+          camera - earth_center,
           point - earth_center,
-          normal,
-          sun_direction
-      );
-
-      let diffuse = sphere_albedo * (
-          irradiance.sun + irradiance.sky
-      ) / PI;
-
-      // Specular highlight
-      let specularMask = textureSampleLevel(
-          specularMap,
-          specularSampler,
-          uv,
-          0.0
-      ).r;
-
-      let view_direction = normalize(camera - point);
-      let halfway_dir = normalize(sun_direction + view_direction);
-
-      let specular_strength = 0.25;
-      let shininess = 64.0;
-
-      let specular = specularMask * specular_strength *
-          pow(max(dot(normal, halfway_dir), 0.0), shininess);
-
-      sphere_radiance = diffuse + vec3f(specular) * irradiance.sun;
+          shadow_length,
+          sun_direction);
+      sphere_radiance = sphere_radiance * scatter.transmittance + scatter.radiance;
     }
   }
 
@@ -1209,6 +1260,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
   // ======================================================================
   var ground_alpha = 0.0;
   var ground_radiance = vec3f(0.0);
+  var ground_distance_for_composite = 1e30;
   let earth_offset = camera - earth_center;
   let earth_dot_v = dot(earth_offset, view_dir);
   let earth_dot_earth = dot(earth_offset, earth_offset);
@@ -1219,6 +1271,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
   if (ground_discriminant >= 0.0) {
     let ground_distance = -earth_dot_v - sqrt(ground_discriminant);
     if (ground_distance > 0.0) {
+      ground_distance_for_composite = ground_distance;
       // Compute direct lighting at ground intersection
       let point = camera + view_dir * ground_distance;
       let normal = normalize(point - earth_center);
@@ -1226,8 +1279,9 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
           ATMOSPHERE, point - earth_center, normal, sun_direction);
 
       // Apply sun visibility (occlusion by demo sphere) and sky visibility
+      let cloud_shadow = CloudShadowFactor(point, sun_direction);
       ground_radiance = kGroundAlbedo * (1.0 / PI) * (
-          irradiance.sun * GetSunVisibility(point, sun_direction, sun_size) +
+          irradiance.sun * cloud_shadow * GetSunVisibility(point, sun_direction, sun_size) +
           irradiance.sky * GetSkyVisibility(point));
 
       // Add atmospheric scattering between camera and ground
@@ -1235,17 +1289,56 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
           max(0.0, min(shadow_out, ground_distance) - shadow_in) *
           lightshaft_fadein_hack;
       let scatter = GetSkyRadianceToPoint(
-        ATMOSPHERE,
-        camera - earth_center,
-        point - earth_center,
-        shadow_length,
-        sun_direction
-      );
+          ATMOSPHERE,
+          camera - earth_center,
+          point - earth_center,
+          shadow_length,
+          sun_direction);
+      ground_radiance = ground_radiance * scatter.transmittance + scatter.radiance;
+      ground_alpha = 1.0;
+    }
+  }
 
-      sphere_radiance =
-          sphere_radiance * scatter.transmittance + scatter.radiance;
-          }
-        }
+  // ======================================================================
+  // Cloud shell: textured translucent sphere 8 km above the ground.
+  // ======================================================================
+  let cloud_radius = ATMOSPHERE.bottom_radius + 8.0;
+  let cloud_p = camera - earth_center;
+  let cloud_b = dot(cloud_p, view_dir);
+  let cloud_c = dot(cloud_p, cloud_p) - cloud_radius * cloud_radius;
+  let cloud_disc = cloud_b * cloud_b - cloud_c;
+  var cloud_alpha = 0.0;
+  var cloud_radiance = vec3f(0.0);
+  if (cloud_disc >= 0.0) {
+    let cloud_root = sqrt(cloud_disc);
+    let cloud_near = -cloud_b - cloud_root;
+    let cloud_far = -cloud_b + cloud_root;
+    let cloud_distance = select(cloud_far, cloud_near, cloud_near > 0.0);
+    if (cloud_distance > 0.0 && cloud_distance < min(ground_distance_for_composite, sphere_distance_for_composite)) {
+      let cloud_point = camera + view_dir * cloud_distance;
+      let cloud_normal = normalize(cloud_point - earth_center);
+      let cloud_uv = SphereUV(cloud_normal);
+      let cloud_sample = textureSample(cloud_texture, planet_surface_sampler, cloud_uv);
+      let cloud_dims = vec2f(textureDimensions(cloud_bump_texture, 0));
+      let cloud_du = 1.0 / max(cloud_dims.x, 1.0);
+      let cloud_dv = 1.0 / max(cloud_dims.y, 1.0);
+      let ch_left = SampleHeight16(cloud_bump_texture, cloud_uv - vec2f(cloud_du, 0.0));
+      let ch_right = SampleHeight16(cloud_bump_texture, cloud_uv + vec2f(cloud_du, 0.0));
+      let ch_up = SampleHeight16(cloud_bump_texture, cloud_uv - vec2f(0.0, cloud_dv));
+      let ch_down = SampleHeight16(cloud_bump_texture, cloud_uv + vec2f(0.0, cloud_dv));
+      let cloud_east = normalize(vec3f(-cloud_normal.y, cloud_normal.x, 0.0001));
+      let cloud_north = normalize(cross(cloud_normal, cloud_east));
+      let cloud_slope_u = (ch_right - ch_left) / (2.0 * cloud_du) * (0.5 / (2.0 * PI * cloud_radius));
+      let cloud_slope_v = (ch_down - ch_up) / (2.0 * cloud_dv) * (0.5 / (PI * cloud_radius));
+      let cloud_bumped_normal = normalize(cloud_normal - cloud_east * cloud_slope_u - cloud_north * cloud_slope_v);
+      let cloud_irradiance = GetSunAndSkyIrradiance(ATMOSPHERE, cloud_point - earth_center, cloud_bumped_normal, sun_direction);
+      let cloud_lighting = cloud_irradiance.sun + cloud_irradiance.sky;
+      cloud_radiance = pow(max(cloud_sample.rgb, vec3f(0.0)), vec3f(2.2)) * cloud_lighting * (1.0 / PI);
+      let cloud_scatter = GetSkyRadianceToPoint(ATMOSPHERE, camera - earth_center, cloud_point - earth_center, 0.0, sun_direction);
+      cloud_radiance = cloud_radiance * cloud_scatter.transmittance + cloud_scatter.radiance;
+      cloud_alpha = clamp(cloud_sample.a, 0.0, 1.0);
+    }
+  }
 
   // ======================================================================
   // Sky and Sun Disk Rendering
@@ -1272,6 +1365,7 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
   // Composite ground and sphere over sky (front-to-back blending)
   radiance = mix(radiance, ground_radiance, ground_alpha);
   radiance = mix(radiance, sphere_radiance, sphere_alpha);
+  radiance = mix(radiance, cloud_radiance, cloud_alpha);
 
   // Apply tone mapping (Reinhard) and gamma correction (sRGB)
   // 1. Exposure adjustment
