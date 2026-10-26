@@ -46,6 +46,8 @@ struct Globals {
 @group(0) @binding(4) var lut_sampler : sampler;                      // Linear sampler for all LUTs
 @group(1) @binding(0) var sphereTexture: texture_2d<f32>;
 @group(1) @binding(1) var sphereSampler: sampler;
+@group(1) @binding(2) var specularMap: texture_2d<f32>;
+@group(1) @binding(3) var specularSampler: sampler;
 
 fn sphereUV(point: vec3f) -> vec2f {
     let normal = normalize(point - kSphereCenter);
@@ -90,6 +92,9 @@ const sr : f32 = 1.0;     // Steradians (solid angle)
 const watt : f32 = 1.0;   // Watts (power)
 const lm : f32 = 1.0;     // Lumens (luminous flux)
 const PI : f32 = 3.14159265358979323846;
+
+const specular_strength: f32 = 0.5;
+const shininess: f32 = 32.0;
 
 // Derived units for radiometric quantities
 const m2 : f32 = m * m;
@@ -1156,7 +1161,9 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
       let point = camera + view_dir * distance_to_intersection;
       let normal = normalize(point - kSphereCenter);
 
+      
       let uv = sphereUV(point);
+
       let texel = textureSampleLevel(
           sphereTexture,
           sphereSampler,
@@ -1166,24 +1173,34 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
       let sphere_albedo = texel.rgb;
 
       let irradiance = GetSunAndSkyIrradiance(
-          ATMOSPHERE, point - earth_center, normal, sun_direction);
-
-      sphere_radiance = sphere_albedo * (1.0 / PI) *
-          (irradiance.sun + irradiance.sky);
-
-      // Add atmospheric scattering between camera and sphere
-      let shadow_length =
-          max(0.0, min(shadow_out, distance_to_intersection) - shadow_in) *
-          lightshaft_fadein_hack;
-      let scatter = GetSkyRadianceToPoint(
           ATMOSPHERE,
-          camera - earth_center,
           point - earth_center,
-          shadow_length,
-          sun_direction);
-      sphere_radiance = sphere_radiance * scatter.transmittance + scatter.radiance;
+          normal,
+          sun_direction
+      );
 
+      let diffuse = sphere_albedo * (
+          irradiance.sun + irradiance.sky
+      ) / PI;
 
+      // Specular highlight
+      let specularMask = textureSampleLevel(
+          specularMap,
+          specularSampler,
+          uv,
+          0.0
+      ).r;
+
+      let view_direction = normalize(camera - point);
+      let halfway_dir = normalize(sun_direction + view_direction);
+
+      let specular_strength = 0.25;
+      let shininess = 64.0;
+
+      let specular = specularMask * specular_strength *
+          pow(max(dot(normal, halfway_dir), 0.0), shininess);
+
+      sphere_radiance = diffuse + vec3f(specular) * irradiance.sun;
     }
   }
 
@@ -1218,15 +1235,17 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
           max(0.0, min(shadow_out, ground_distance) - shadow_in) *
           lightshaft_fadein_hack;
       let scatter = GetSkyRadianceToPoint(
-          ATMOSPHERE,
-          camera - earth_center,
-          point - earth_center,
-          shadow_length,
-          sun_direction);
-      ground_radiance = ground_radiance * scatter.transmittance + scatter.radiance;
-      ground_alpha = 1.0;
-    }
-  }
+        ATMOSPHERE,
+        camera - earth_center,
+        point - earth_center,
+        shadow_length,
+        sun_direction
+      );
+
+      sphere_radiance =
+          sphere_radiance * scatter.transmittance + scatter.radiance;
+          }
+        }
 
   // ======================================================================
   // Sky and Sun Disk Rendering

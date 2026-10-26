@@ -440,12 +440,17 @@ async function main() {
 
     const { texture: sphereTexture, sampler: sphereSampler } =
     await loadSphereTexture(gpuState.device, './surface.png');
+  
+    const { texture: specularMap, sampler: specularSampler } =
+    await loadSphereTexture(gpuState.device, './specular.png');
 
-  const sphereTextureBindGroup = gpuState.device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(1),
-    entries: [
+    const sphereTextureBindGroup = gpuState.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(1),
+      entries: [
         { binding: 0, resource: sphereTexture.createView() },
         { binding: 1, resource: sphereSampler },
+        { binding: 2, resource: specularMap.createView() },
+        { binding: 3, resource: specularSampler },
       ],
     });
 
