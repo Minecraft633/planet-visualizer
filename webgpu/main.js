@@ -23,6 +23,40 @@ import {
 // Import WGSL shader code as raw string (Vite handles this via ?raw suffix)
 import skyShaderWGSL from './shader.wgsl?raw';
 
+async function loadSphereTexture(device, url) {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Could not load texture: ${url}`);
+  }
+
+  const bitmap = await createImageBitmap(await response.blob());
+
+  const texture = device.createTexture({
+    label: "Sphere texture",
+    size: [bitmap.width, bitmap.height],
+    format: "rgba8unorm",
+    usage:
+      GPUTextureUsage.TEXTURE_BINDING |
+      GPUTextureUsage.COPY_DST,
+  });
+
+  device.queue.copyExternalImageToTexture(
+    { source: bitmap },
+    { texture },
+    [bitmap.width, bitmap.height]
+  );
+
+  const sampler = device.createSampler({
+    addressModeU: "repeat",
+    addressModeV: "clamp-to-edge",
+    magFilter: "linear",
+    minFilter: "linear",
+  });
+
+  return { texture, sampler };
+}
+
 // Get references to DOM elements
 const canvas = document.getElementById('webgpu-canvas');
 const helpElement = document.getElementById('help');
@@ -255,7 +289,7 @@ async function initPipeline(device, format) {
  * @param {GPUBindGroup} bindGroup - Bind group containing uniforms and textures
  * @param {GPUBuffer} vertexBuffer - Vertex buffer with fullscreen quad positions
  */
-function draw(device, context, pipeline, bindGroup, vertexBuffer) {
+function draw(device, context, pipeline, bindGroup, sphereTextureBindGroup, vertexBuffer) {
   // Create a command encoder to record rendering commands
   const commandEncoder = device.createCommandEncoder();
 
@@ -277,6 +311,7 @@ function draw(device, context, pipeline, bindGroup, vertexBuffer) {
   const passEncoder = commandEncoder.beginRenderPass(renderPassDescriptor);
   passEncoder.setPipeline(pipeline);
   passEncoder.setBindGroup(0, bindGroup);
+  passEncoder.setBindGroup(1, sphereTextureBindGroup);
   passEncoder.setVertexBuffer(0, vertexBuffer);
   passEncoder.draw(4); // Draw 4 vertices (triangle-strip creates 2 triangles)
   passEncoder.end();
@@ -403,6 +438,17 @@ async function main() {
     const gpuState = await initWebGPU(canvas);
     const pipeline = await initPipeline(gpuState.device, gpuState.format);
 
+    const { texture: sphereTexture, sampler: sphereSampler } =
+    await loadSphereTexture(gpuState.device, './surface.png');
+
+  const sphereTextureBindGroup = gpuState.device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(1),
+    entries: [
+        { binding: 0, resource: sphereTexture.createView() },
+        { binding: 1, resource: sphereSampler },
+      ],
+    });
+
     // Load precomputed lookup tables (transmittance, scattering, irradiance)
     const precomputedTextures = await loadPrecomputedTextures(gpuState.device);
 
@@ -440,7 +486,7 @@ async function main() {
     const render = () => {
       const data = updateGlobalUniforms(canvas, controls);
       writeGlobalUniforms(gpuState.device, uniformBuffer, data);
-      draw(gpuState.device, gpuState.context, pipeline, bindGroup, quadBuffer);
+      draw(gpuState.device, gpuState.context, pipeline, bindGroup, sphereTextureBindGroup, quadBuffer);
       requestAnimationFrame(render);
     };
     render(); // Start the render loop
@@ -544,7 +590,7 @@ async function main() {
         controls.viewZenithAngleRadians += dy / kScale;
         // Clamp zenith to [0, π/2] to prevent flipping upside down
         controls.viewZenithAngleRadians =
-            Math.min(Math.PI / 2, Math.max(0, controls.viewZenithAngleRadians));
+          Math.max(0, Math.min(Math.PI, controls.viewZenithAngleRadians));
         controls.viewAzimuthAngleRadians += dx / kScale;
       }
 

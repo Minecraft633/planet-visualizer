@@ -44,6 +44,17 @@ struct Globals {
 @group(0) @binding(2) var scattering_texture : texture_3d<f32>;      // Combined scattering LUT (4D packed into 3D)
 @group(0) @binding(3) var irradiance_texture : texture_2d<f32>;      // Ground irradiance LUT
 @group(0) @binding(4) var lut_sampler : sampler;                      // Linear sampler for all LUTs
+@group(1) @binding(0) var sphereTexture: texture_2d<f32>;
+@group(1) @binding(1) var sphereSampler: sampler;
+
+fn sphereUV(point: vec3f) -> vec2f {
+    let normal = normalize(point - kSphereCenter);
+
+    let u = atan2(normal.y, normal.x) / (2.0 * PI) + 0.5;
+    let v = acos(clamp(normal.z, -1.0, 1.0)) / PI;
+
+    return vec2f(u, v);
+}
 
 // ============================================================================
 // ATMOSPHERE CONSTANTS AND TYPE DEFINITIONS
@@ -114,7 +125,7 @@ const SUN_SPECTRAL_RADIANCE_TO_LUMINANCE : vec3f =
  */
 const kLengthUnitInMeters : f32 = 1000.0;
 const kSphereCenter : vec3f = vec3f(0.0, 0.0, 1000.0) / kLengthUnitInMeters;
-const kSphereRadius : f32 = 1000.0 / kLengthUnitInMeters;
+const kSphereRadius : f32 = 6360000 / kLengthUnitInMeters;
 const kSphereAlbedo : vec3f = vec3f(0.8);
 const kGroundAlbedo : vec3f = vec3f(0.0, 0.0, 0.04);
 
@@ -1144,9 +1155,20 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
       // Compute direct lighting (sun + sky) at intersection point
       let point = camera + view_dir * distance_to_intersection;
       let normal = normalize(point - kSphereCenter);
+
+      let uv = sphereUV(point);
+      let texel = textureSampleLevel(
+          sphereTexture,
+          sphereSampler,
+          uv,
+          0.0
+      );
+      let sphere_albedo = texel.rgb;
+
       let irradiance = GetSunAndSkyIrradiance(
           ATMOSPHERE, point - earth_center, normal, sun_direction);
-      sphere_radiance = kSphereAlbedo * (1.0 / PI) *
+
+      sphere_radiance = sphere_albedo * (1.0 / PI) *
           (irradiance.sun + irradiance.sky);
 
       // Add atmospheric scattering between camera and sphere
@@ -1160,6 +1182,8 @@ fn fs_main(input : VertexOutput) -> @location(0) vec4f {
           shadow_length,
           sun_direction);
       sphere_radiance = sphere_radiance * scatter.transmittance + scatter.radiance;
+
+
     }
   }
 
