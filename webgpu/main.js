@@ -358,7 +358,7 @@ function updateGlobalUniforms(canvas, state) {
 
   // Earth center position in world space
   // Earth radius is 6360 km, positioned below the origin
-  const earthCenter = [0, 0, -6360000 / LENGTH_UNIT_IN_METERS];
+  const earthCenter = [0, 0, 0 / LENGTH_UNIT_IN_METERS];
 
   // Pack all data into the uniform buffer (converting matrices to column-major)
   copyRowMajorToColumnMajor(uniformScratch, 0, viewFromClip);   // Offset 0: mat4x4 (16 floats)
